@@ -1,0 +1,77 @@
+"""Thin async wrapper over the OpenAI-compatible GLM chat API."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import openai
+from openai import AsyncOpenAI
+
+from .config import Config
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+
+class GLMError(Exception):
+    """Raised when a GLM API call fails (after retries, if retryable)."""
+
+
+def _retryable(exc: Exception) -> bool:
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in RETRYABLE_STATUS
+
+
+class GLMClient:
+    """All GLM traffic goes through this class (chat now, transcriptions later)."""
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._client = AsyncOpenAI(
+            api_key=cfg.glm_api_key,
+            base_url=cfg.glm_base_url,
+            timeout=180.0,
+            max_retries=0,  # retries handled here with readable logging
+        )
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int = 4000,
+    ) -> Any:
+        """Call chat/completions and return the assistant message object."""
+        last_exc: Exception | None = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = await self._client.chat.completions.create(
+                    model=model or self._cfg.glm_model,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    # GLM-specific: disable thinking where supported (ignored otherwise).
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                return response.choices[0].message
+            except Exception as exc:
+                last_exc = exc
+                if not _retryable(exc) or attempt == MAX_RETRIES:
+                    raise GLMError(str(exc)) from exc
+                delay = 2.0**attempt
+                logger.warning(
+                    "GLM attempt %d/%d failed (%s); retrying in %.0fs",
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        raise GLMError(str(last_exc))  # pragma: no cover - for type checkers

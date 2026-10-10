@@ -11,10 +11,12 @@ from telegram.ext import (
 )
 
 from . import handlers
+from .agent import Agent
 from .config import Config
+from .history import History
 
 
-def build_application(cfg: Config) -> Application:
+def build_application(cfg: Config, agent: Agent, history: History) -> Application:
     """Build the python-telegram-bot Application with all handlers registered."""
     application: Application = (
         ApplicationBuilder()
@@ -24,8 +26,12 @@ def build_application(cfg: Config) -> Application:
         .build()
     )
     application.bot_data["config"] = cfg
+    application.bot_data["agent"] = agent
+    application.bot_data["history"] = history
 
     application.add_handler(CommandHandler(["start", "help"], handlers.cmd_start))
+    application.add_handler(CommandHandler("new", handlers.cmd_new))
+    application.add_handler(CommandHandler("status", handlers.cmd_status))
     application.add_handler(MessageHandler(~filters.COMMAND, handlers.on_message))
     application.add_error_handler(handlers.on_error)
     return application

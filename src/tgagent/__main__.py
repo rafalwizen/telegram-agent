@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import sys
 
+from .agent import Agent
 from .bot import build_application
 from .config import ConfigError, load_config
+from .glm_client import GLMClient
+from .history import History
 from .logging_setup import setup_logging
 
 
@@ -22,9 +25,15 @@ def main() -> None:
         (cfg.workspace_dir / sub).mkdir(parents=True, exist_ok=True)
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
 
-    application = build_application(cfg)
-    # Drop messages sent while the bot was down; we only want fresh updates.
-    application.run_polling(drop_pending_updates=True)
+    history = History(cfg.data_dir / "bot.db")
+    glm = GLMClient(cfg)
+    agent = Agent(cfg, glm, history)
+    application = build_application(cfg, agent, history)
+    try:
+        # Drop messages sent while the bot was down; we only want fresh updates.
+        application.run_polling(drop_pending_updates=True)
+    finally:
+        history.close()
 
 
 if __name__ == "__main__":
