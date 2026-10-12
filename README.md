@@ -62,6 +62,8 @@ Requires Python 3.11+ and `ffmpeg` on PATH for voice notes (optional in dev).
 git clone https://github.com/rafalwizen/telegram-agent.git
 cd telegram-agent
 cp .env.example .env && nano .env   # fill in secrets
+mkdir -p data/workspace data/bot    # bind-mount targets
+sudo chown -R 1000:1000 data        # container runs as uid 1000 (appuser)
 docker compose up -d --build
 docker compose logs -f
 ```
