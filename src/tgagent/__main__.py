@@ -28,7 +28,7 @@ def main() -> None:
     history = History(cfg.data_dir / "bot.db")
     glm = GLMClient(cfg)
     agent = Agent(cfg, glm, history)
-    application = build_application(cfg, agent, history)
+    application = build_application(cfg, agent, history, glm)
     try:
         # Drop messages sent while the bot was down; we only want fresh updates.
         application.run_polling(drop_pending_updates=True)
