@@ -10,7 +10,7 @@ from typing import Any
 
 from .config import Config
 from .extract import extract_text
-from .sandbox import PathOutsideWorkspace, safe_path
+from .sandbox import PathOutsideWorkspace, run_python, safe_path
 
 MAX_LIST_ENTRIES = 400
 READ_LINE_LIMIT = 2000
@@ -77,6 +77,17 @@ async def _tool_read_file(args: dict[str, Any], ctx: ToolContext) -> str:
     return await asyncio.to_thread(run)
 
 
+async def _tool_write_file(args: dict[str, Any], ctx: ToolContext) -> str:
+    def run() -> str:
+        path = safe_path(ctx.workspace, _path_arg(args))
+        content = str(args.get("content") or "")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return f"wrote {len(content)} chars to {path.relative_to(ctx.workspace).as_posix()}"
+
+    return await asyncio.to_thread(run)
+
+
 async def _tool_extract_text(args: dict[str, Any], ctx: ToolContext) -> str:
     path = safe_path(ctx.workspace, _path_arg(args))
     pages = str(args.get("pages") or "")
@@ -84,10 +95,24 @@ async def _tool_extract_text(args: dict[str, Any], ctx: ToolContext) -> str:
     return _truncate(text, ctx.cfg.tool_result_limit)
 
 
+async def _tool_run_python(args: dict[str, Any], ctx: ToolContext) -> str:
+    result = await run_python(
+        _path_arg(args),
+        str(args.get("args") or ""),
+        ctx.workspace,
+        timeout_s=ctx.cfg.py_timeout_s,
+        mem_mb=ctx.cfg.py_mem_mb,
+        output_limit=ctx.cfg.tool_result_limit,
+    )
+    return _truncate(result, ctx.cfg.tool_result_limit)
+
+
 TOOLS: dict[str, Any] = {
     "list_files": _tool_list_files,
     "read_file": _tool_read_file,
+    "write_file": _tool_write_file,
     "extract_text": _tool_extract_text,
+    "run_python": _tool_run_python,
 }
 
 TOOL_SPECS: list[dict[str, Any]] = [
@@ -137,6 +162,26 @@ TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a text file in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "File path relative to the workspace root, e.g. scripts/analyze.py."
+                        ),
+                    },
+                    "content": {"type": "string", "description": "Full file content to write."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "extract_text",
             "description": (
                 "Extract text from a document (PDF, DOCX, XLSX, CSV, TXT and similar). "
@@ -152,6 +197,34 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "pages": {
                         "type": "string",
                         "description": "PDF pages to extract, e.g. '1-5,8'.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Run a Python script that exists in the workspace. Working directory is the "
+                "workspace root; stdout/stderr and the exit code are returned."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Script path relative to the workspace root, e.g. scripts/analyze.py."
+                        ),
+                    },
+                    "args": {
+                        "type": "string",
+                        "description": (
+                            "Optional command-line arguments for the script, as one string."
+                        ),
                     },
                 },
                 "required": ["path"],
