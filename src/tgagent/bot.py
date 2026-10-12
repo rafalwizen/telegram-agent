@@ -36,7 +36,14 @@ async def _heartbeat_loop(application: Application) -> None:
 
 
 async def _post_init(application: Application) -> None:
-    application.create_task(_heartbeat_loop(application))
+    # Plain asyncio task: PTB warns about Application.create_task before running state.
+    application.bot_data["_heartbeat_task"] = asyncio.create_task(_heartbeat_loop(application))
+
+
+async def _post_shutdown(application: Application) -> None:
+    task = application.bot_data.pop("_heartbeat_task", None)
+    if task is not None:
+        task.cancel()
 
 
 def build_application(cfg: Config, agent: Agent, history: History, glm: GLMClient) -> Application:
@@ -53,6 +60,7 @@ def build_application(cfg: Config, agent: Agent, history: History, glm: GLMClien
     application.bot_data["history"] = history
     application.bot_data["glm"] = glm
     application.post_init = _post_init
+    application.post_shutdown = _post_shutdown
 
     application.add_handler(CommandHandler(["start", "help"], handlers.cmd_start))
     application.add_handler(CommandHandler("new", handlers.cmd_new))

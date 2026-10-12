@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import sys
+import time
+
+import telegram.error
 
 from .agent import Agent
 from .bot import build_application
@@ -10,6 +14,11 @@ from .config import ConfigError, load_config
 from .glm_client import GLMClient
 from .history import History
 from .logging_setup import setup_logging
+
+logger = logging.getLogger(__name__)
+
+# Wait time before reconnecting after a transient Telegram network error.
+RECONNECT_DELAY_S = 30
 
 
 def main() -> None:
@@ -28,10 +37,23 @@ def main() -> None:
     history = History(cfg.data_dir / "bot.db")
     glm = GLMClient(cfg)
     agent = Agent(cfg, glm, history)
-    application = build_application(cfg, agent, history, glm)
     try:
-        # Drop messages sent while the bot was down; we only want fresh updates.
-        application.run_polling(drop_pending_updates=True)
+        while True:
+            # A fresh Application per attempt: run_polling() may only be called once.
+            application = build_application(cfg, agent, history, glm)
+            try:
+                # Drop messages sent while the bot was down; we only want fresh updates.
+                application.run_polling(drop_pending_updates=True)
+                return  # clean shutdown (SIGTERM/SIGINT)
+            except (telegram.error.TimedOut, telegram.error.NetworkError) as exc:
+                # Transient connectivity problems must not crash the bot;
+                # Docker's restart policy stays as the last line of defence.
+                logger.error(
+                    "Telegram network error (%s); reconnecting in %d s",
+                    exc,
+                    RECONNECT_DELAY_S,
+                )
+                time.sleep(RECONNECT_DELAY_S)
     finally:
         history.close()
 
