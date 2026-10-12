@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 import time
 from collections import defaultdict
+from pathlib import Path
 
 import telegram.error
 from telegram import Message, Update
 from telegram.ext import ContextTypes
 
 from .agent import Agent, AgentError
-from .attachments import AttachmentError, attachment_note, save_document
+from .attachments import (
+    AttachmentError,
+    attachment_note,
+    save_document,
+    save_photo,
+)
 from .config import Config
+from .glm_client import GLMClient, GLMError
 from .history import History
 from .splitter import split_for_telegram
+from .voice import VoiceError, voice_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +32,7 @@ logger = logging.getLogger(__name__)
 LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 SEND_ATTEMPTS = 3
 PROGRESS_EDIT_INTERVAL = 2.0  # seconds between placeholder progress edits
+DEFAULT_IMAGE_PROMPT = "Describe what is in this image, briefly."
 
 
 def _config(context: ContextTypes.DEFAULT_TYPE) -> Config:
@@ -35,6 +45,10 @@ def _agent(context: ContextTypes.DEFAULT_TYPE) -> Agent:
 
 def _history(context: ContextTypes.DEFAULT_TYPE) -> History:
     return context.bot_data["history"]
+
+
+def _glm(context: ContextTypes.DEFAULT_TYPE) -> GLMClient:
+    return context.bot_data["glm"]
 
 
 def is_allowed(update: Update, allowed_ids: frozenset[int]) -> bool:
@@ -84,7 +98,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply_safe(
         message,
         "Hi! I'm your personal AI assistant.\n\n"
-        "Send me a message or a file (as a document) and I'll take a look. Commands:\n"
+        "Send me text, a photo, a voice note or a file (as a document). Commands:\n"
         "/new — start a fresh conversation (clear context)\n"
         "/status — current model and context stats",
     )
@@ -113,39 +127,68 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     stats = _history(context).stats(message.chat_id)
     await _reply_safe(
         message,
-        f"Model: {cfg.glm_model}\n"
+        f"Model: {cfg.glm_model} (vision: {cfg.glm_vision_model}, ASR: {cfg.glm_asr_model})\n"
         f"Messages in context: {stats['messages']}\n"
         f"Context ≈ {stats['est_tokens']} / {cfg.context_token_budget} tokens\n"
         f"Workspace: {cfg.workspace_dir}",
     )
 
 
-async def _collect_user_text(message: Message, context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    """Turn an incoming message (text or document) into the user turn for the agent."""
+async def _transcribe_voice(message: Message, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Download and transcribe a voice note; returns the user-facing text."""
     cfg = _config(context)
-    if message.voice or message.video_note or message.audio:
+    voice = message.voice
+    if voice is None:
+        return ""
+    if voice.file_size and voice.file_size > 20 * 1024 * 1024:
+        raise AttachmentError("Voice message too large (over 20 MB).")
+    tg_file = await context.bot.get_file(voice.file_id)
+    with tempfile.TemporaryDirectory(prefix="tgvoice-") as tmp:
+        ogg = Path(tmp) / "voice.ogg"
+        await tg_file.download_to_drive(ogg)
+        return await voice_to_text(
+            ogg, voice.duration or 0, _glm(context), Path(tmp), cfg.max_voice_min
+        )
+
+
+async def _collect_user_text(
+    message: Message, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[str, list[Path]] | None:
+    """Turn an incoming message into (user_text, image_paths), or None if not usable."""
+    cfg = _config(context)
+    workspace = cfg.workspace_dir
+    images: list[Path] = []
+
+    if message.voice is not None:
+        text = await _transcribe_voice(message, context)
+        return f"[voice message transcription]\n{text}", []
+
+    if message.video_note is not None or message.audio is not None:
         await _reply_safe(
-            message, "Voice messages arrive in a later phase — please send text for now."
+            message, "I can't process audio/video files yet — send a voice note instead."
         )
         return None
+
     if message.photo:
-        await _reply_safe(
-            message,
-            "Image analysis arrives in a later phase — for now please send images as documents.",
-        )
-        return None
+        photo = message.photo[-1]  # highest resolution variant
+        rel = await save_photo(context.bot, photo, workspace)
+        note = attachment_note(rel, f"photo, {(photo.file_size or 0) / 1024:.0f} KB")
+        text = f"{message.caption or DEFAULT_IMAGE_PROMPT}\n\n{note}"
+        images.append(workspace / rel)
+        return text, images
+
     if message.document is not None:
-        try:
-            rel = await save_document(context.bot, message.document, cfg.workspace_dir)
-        except AttachmentError as exc:
-            await _reply_safe(message, f"⚠️ {exc}")
-            return None
         doc = message.document
+        rel = await save_document(context.bot, doc, workspace)
         meta = f"{doc.mime_type or 'unknown type'}, {(doc.file_size or 0) / 1024:.0f} KB"
-        note = attachment_note(rel, meta)
-        return f"{message.caption or ''}\n\n{note}".strip()
+        text = f"{message.caption or ''}\n\n{attachment_note(rel, meta)}".strip()
+        if (doc.mime_type or "").startswith("image/"):
+            images.append(workspace / rel)
+        return text, images
+
     if message.text:
-        return message.text
+        return message.text, []
+
     return None
 
 
@@ -160,9 +203,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if message is None:
         return
 
-    user_text = await _collect_user_text(message, context)
-    if user_text is None:
+    try:
+        collected = await _collect_user_text(message, context)
+    except (AttachmentError, VoiceError, GLMError) as exc:
+        await _reply_safe(message, f"⚠️ {exc}")
         return
+    if collected is None:
+        return
+    user_text, image_paths = collected
 
     chat_id = message.chat_id
     async with LOCKS[chat_id]:
@@ -178,7 +226,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await _edit_text(placeholder, f"⚙️ {tool} ({iteration}/{cfg.max_tool_iters})…")
 
         try:
-            final = await _agent(context).handle_turn(chat_id, user_text, on_progress=on_progress)
+            final = await _agent(context).handle_turn(
+                chat_id, user_text, image_paths=image_paths or None, on_progress=on_progress
+            )
         except AgentError as exc:
             await _edit_text(placeholder, f"⚠️ {exc}")
             return

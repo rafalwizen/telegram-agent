@@ -1,9 +1,10 @@
-"""Thin async wrapper over the OpenAI-compatible GLM chat API."""
+"""Thin async wrapper over the OpenAI-compatible GLM APIs (chat + audio transcription)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 import openai
@@ -29,7 +30,7 @@ def _retryable(exc: Exception) -> bool:
 
 
 class GLMClient:
-    """All GLM traffic goes through this class (chat now, transcriptions later)."""
+    """All GLM traffic goes through this class."""
 
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
@@ -65,13 +66,30 @@ class GLMClient:
                 last_exc = exc
                 if not _retryable(exc) or attempt == MAX_RETRIES:
                     raise GLMError(str(exc)) from exc
-                delay = 2.0**attempt
-                logger.warning(
-                    "GLM attempt %d/%d failed (%s); retrying in %.0fs",
-                    attempt,
-                    MAX_RETRIES,
-                    exc,
-                    delay,
-                )
-                await asyncio.sleep(delay)
+                await self._sleep_retry(attempt, exc)
         raise GLMError(str(last_exc))  # pragma: no cover - for type checkers
+
+    async def transcribe(self, audio_path: Path) -> str:
+        """Transcribe an MP3/WAV file via the audio/transcriptions endpoint."""
+        last_exc: Exception | None = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with audio_path.open("rb") as fh:
+                    response = await self._client.audio.transcriptions.create(
+                        model=self._cfg.glm_asr_model,
+                        file=fh,
+                    )
+                return (response.text or "").strip()
+            except Exception as exc:
+                last_exc = exc
+                if not _retryable(exc) or attempt == MAX_RETRIES:
+                    raise GLMError(str(exc)) from exc
+                await self._sleep_retry(attempt, exc)
+        raise GLMError(str(last_exc))  # pragma: no cover - for type checkers
+
+    async def _sleep_retry(self, attempt: int, exc: Exception) -> None:
+        delay = 2.0**attempt
+        logger.warning(
+            "GLM attempt %d/%d failed (%s); retrying in %.0fs", attempt, MAX_RETRIES, exc, delay
+        )
+        await asyncio.sleep(delay)

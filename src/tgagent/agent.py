@@ -1,10 +1,11 @@
-"""Agent turn handling: GLM completion with a tool-calling loop."""
+"""Agent turn handling: GLM completion with a tool-calling loop and image routing."""
 
 from __future__ import annotations
 
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from .config import Config
 from .glm_client import GLMClient, GLMError
@@ -12,6 +13,7 @@ from .history import History
 from .prompts import SYSTEM_PROMPT
 from .tools import TOOL_SPECS, ToolContext
 from .tools import dispatch as dispatch_tool
+from .vision import prepare_image
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,11 @@ class Agent:
         self._history = history
 
     async def handle_turn(
-        self, chat_id: int, user_text: str, on_progress: ProgressFn | None = None
+        self,
+        chat_id: int,
+        user_text: str,
+        image_paths: list[Path] | None = None,
+        on_progress: ProgressFn | None = None,
     ) -> str:
         """Process one user turn; returns the final answer text for Telegram."""
         self._history.append(chat_id, "user", user_text)
@@ -39,10 +45,14 @@ class Agent:
         )
         ctx = ToolContext(chat_id=chat_id, workspace=self._cfg.workspace_dir, cfg=self._cfg)
 
+        model = self._cfg.glm_model
+        if image_paths:
+            model = self._attach_images(messages, image_paths) or model
+
         final: str | None = None
         for iteration in range(1, self._cfg.max_tool_iters + 1):
             try:
-                answer = await self._glm.chat(messages, model=self._cfg.glm_model, tools=TOOL_SPECS)
+                answer = await self._glm.chat(messages, model=model, tools=TOOL_SPECS)
             except GLMError as exc:
                 logger.error("GLM chat failed: %s", exc)
                 raise AgentError(f"GLM API error — please try again. ({exc})") from exc
@@ -95,3 +105,18 @@ class Agent:
             final = "I reached my tool-use limit for this message — please rephrase or continue."
         self._history.append(chat_id, "assistant", final)
         return final
+
+    def _attach_images(self, messages: list[dict], image_paths: list[Path]) -> str | None:
+        """Turn the latest user message multimodal; return the vision model name on success.
+
+        Images are attached to the current turn only — history stays text-only to save tokens.
+        """
+        data_urls = [url for url in (prepare_image(p) for p in image_paths) if url]
+        if not data_urls:
+            return None
+        if not messages or messages[-1].get("role") != "user":
+            return None
+        parts: list[dict] = [{"type": "text", "text": messages[-1]["content"]}]
+        parts += [{"type": "image_url", "image_url": {"url": url}} for url in data_urls]
+        messages[-1] = {"role": "user", "content": parts}
+        return self._cfg.glm_vision_model
