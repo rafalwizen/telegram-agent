@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from tgagent.agent import Agent
+import pytest
+
+from tgagent.agent import Agent, AgentError
+from tgagent.glm_client import GLMError
 from tgagent.history import History
 
 
@@ -16,10 +19,15 @@ class FakeGLM:
     def __init__(self, responses: list) -> None:
         self._responses = list(responses)
         self.calls: list[tuple[list[dict], str | None, list | None]] = []
+        self.vision_calls: list[tuple[str, list[dict], list[str]]] = []
 
     async def chat(self, messages, *, model=None, tools=None, max_tokens=4000):
         self.calls.append(([dict(m) for m in messages], model, tools))
         return self._responses.pop(0)
+
+    async def vision_chat(self, system, messages, image_data_urls):
+        self.vision_calls.append((system, [dict(m) for m in messages], list(image_data_urls)))
+        return "A blue rectangle."
 
 
 def _message(content=None, tool_calls=None):
@@ -116,7 +124,7 @@ async def test_plain_answer_without_tools(tmp_path: Path, make_cfg):
     assert len(fake.calls) == 1
 
 
-async def test_image_paths_route_to_vision_model(tmp_path: Path, make_cfg):
+async def test_image_turn_uses_vision_chat(tmp_path: Path, make_cfg):
     from PIL import Image
 
     cfg = make_cfg()
@@ -124,7 +132,7 @@ async def test_image_paths_route_to_vision_model(tmp_path: Path, make_cfg):
     image.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (60, 40), (10, 120, 200)).save(image, format="PNG")
 
-    fake = FakeGLM([_message(content="A blue rectangle.")])
+    fake = FakeGLM([])
     history = History(tmp_path / "bot.db")
     agent = Agent(cfg, fake, history)
     try:
@@ -133,12 +141,47 @@ async def test_image_paths_route_to_vision_model(tmp_path: Path, make_cfg):
         history.close()
 
     assert out == "A blue rectangle."
-    messages, model, _ = fake.calls[0]
-    assert model == cfg.glm_vision_model
-    # The last user message became multimodal: text part + image data URL part.
-    content = messages[-1]["content"]
-    assert isinstance(content, list)
-    assert content[0]["type"] == "text"
-    assert content[0]["text"] == "what is this?"
-    assert content[1]["type"] == "image_url"
-    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    # The text/tool endpoint was not used for the image turn.
+    assert fake.calls == []
+    assert len(fake.vision_calls) == 1
+    system, messages, urls = fake.vision_calls[0]
+    assert system  # non-empty system prompt
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"] == "what is this?"
+    assert len(urls) == 1
+    assert urls[0].startswith("data:image/jpeg;base64,")
+
+
+class _RaisingGLM:
+    def __init__(self, error: GLMError) -> None:
+        self._error = error
+
+    async def chat(self, messages, *, model=None, tools=None, max_tokens=4000):
+        raise self._error
+
+
+async def test_balance_error_gets_friendly_message(tmp_path: Path, make_cfg):
+    glm = _RaisingGLM(
+        GLMError(
+            "Error code: 429 - {'error': {'code': '1113',"
+            " 'message': 'Insufficient balance or no resource package. Please recharge.'}}"
+        )
+    )
+    history = History(tmp_path / "bot.db")
+    agent = Agent(make_cfg(), glm, history)
+    try:
+        with pytest.raises(AgentError, match="balance"):
+            await agent.handle_turn(1, "hello")
+    finally:
+        history.close()
+
+
+async def test_window_limit_gets_friendly_message(tmp_path: Path, make_cfg):
+    glm = _RaisingGLM(GLMError("Error code: 429 - usage limit reached for the 5-hour window"))
+    history = History(tmp_path / "bot.db")
+    agent = Agent(make_cfg(), glm, history)
+    try:
+        with pytest.raises(AgentError, match="5-hour window"):
+            await agent.handle_turn(1, "hello")
+    finally:
+        history.close()

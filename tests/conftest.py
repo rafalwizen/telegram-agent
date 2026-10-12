@@ -17,9 +17,8 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
         "allowed_ids": frozenset({1}),
         "glm_api_key": "key",
         "glm_base_url": "https://example.invalid/v4",
+        "glm_anthropic_base_url": "https://example.invalid/anthropic",
         "glm_model": "test-model",
-        "glm_vision_model": "test-vision-model",
-        "glm_asr_model": "test-asr-model",
         "workspace_dir": tmp_path / "ws",
         "data_dir": tmp_path / "data",
         "max_tool_iters": 2,
@@ -27,7 +26,6 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
         "context_token_budget": 1000,
         "py_timeout_s": 5,
         "py_mem_mb": 256,
-        "max_voice_min": 1,
         "log_level": "INFO",
     }
     defaults.update(overrides)
