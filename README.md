@@ -9,7 +9,7 @@ run its own Python scripts inside a confined workspace directory.
 
 - [x] Phase 1 — scaffold, Telegram connection, user allowlist, echo mode
 - [x] Phase 2 — GLM chat core with history
-- [ ] Phase 3 — attachments and document extraction
+- [x] Phase 3 — attachments and document extraction
 - [ ] Phase 4 — agent tools and Python sandbox
 - [ ] Phase 5 — vision, voice, Docker deployment
 

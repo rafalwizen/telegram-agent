@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 
 import telegram.error
@@ -11,6 +12,7 @@ from telegram import Message, Update
 from telegram.ext import ContextTypes
 
 from .agent import Agent, AgentError
+from .attachments import AttachmentError, attachment_note, save_document
 from .config import Config
 from .history import History
 from .splitter import split_for_telegram
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 # Serialize turns per chat so rapid messages queue instead of racing.
 LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 SEND_ATTEMPTS = 3
+PROGRESS_EDIT_INTERVAL = 2.0  # seconds between placeholder progress edits
 
 
 def _config(context: ContextTypes.DEFAULT_TYPE) -> Config:
@@ -81,7 +84,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply_safe(
         message,
         "Hi! I'm your personal AI assistant.\n\n"
-        "Just send me a message and I'll answer. Commands:\n"
+        "Send me a message or a file (as a document) and I'll take a look. Commands:\n"
         "/new — start a fresh conversation (clear context)\n"
         "/status — current model and context stats",
     )
@@ -117,6 +120,35 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def _collect_user_text(message: Message, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Turn an incoming message (text or document) into the user turn for the agent."""
+    cfg = _config(context)
+    if message.voice or message.video_note or message.audio:
+        await _reply_safe(
+            message, "Voice messages arrive in a later phase — please send text for now."
+        )
+        return None
+    if message.photo:
+        await _reply_safe(
+            message,
+            "Image analysis arrives in a later phase — for now please send images as documents.",
+        )
+        return None
+    if message.document is not None:
+        try:
+            rel = await save_document(context.bot, message.document, cfg.workspace_dir)
+        except AttachmentError as exc:
+            await _reply_safe(message, f"⚠️ {exc}")
+            return None
+        doc = message.document
+        meta = f"{doc.mime_type or 'unknown type'}, {(doc.file_size or 0) / 1024:.0f} KB"
+        note = attachment_note(rel, meta)
+        return f"{message.caption or ''}\n\n{note}".strip()
+    if message.text:
+        return message.text
+    return None
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a regular message: run one agent turn and deliver the answer in chunks."""
     cfg = _config(context)
@@ -127,18 +159,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = update.message
     if message is None:
         return
-    if not message.text:
-        await _reply_safe(
-            message,
-            "For now I only handle text — files, images and voice notes arrive in the next phases.",
-        )
+
+    user_text = await _collect_user_text(message, context)
+    if user_text is None:
         return
 
     chat_id = message.chat_id
     async with LOCKS[chat_id]:
         placeholder = await message.reply_text("…")
+        last_edit = 0.0
+
+        async def on_progress(iteration: int, tool: str, summary: str) -> None:
+            nonlocal last_edit
+            now = time.monotonic()
+            if now - last_edit < PROGRESS_EDIT_INTERVAL:
+                return
+            last_edit = now
+            await _edit_text(placeholder, f"⚙️ {tool} ({iteration}/{cfg.max_tool_iters})…")
+
         try:
-            final = await _agent(context).handle_turn(chat_id, message.text)
+            final = await _agent(context).handle_turn(chat_id, user_text, on_progress=on_progress)
         except AgentError as exc:
             await _edit_text(placeholder, f"⚠️ {exc}")
             return
