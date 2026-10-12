@@ -11,7 +11,7 @@ services:
       - ./data/workspace:/app/workspace # agent's playground + inbox (host-visible)
       - ./data/bot:/app/data # sqlite db + heartbeat
     mem_limit: 2g # hard cap for bot + all sandboxed scripts
-    cpus: 1.5
+    cpus: 1.0 # set to your VPS core count (or below it)
     tmpfs:
       - /tmp:size=256m
     security_opt:
