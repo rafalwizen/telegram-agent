@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -14,17 +13,10 @@ from telegram import Message, Update
 from telegram.ext import ContextTypes
 
 from .agent import Agent, AgentError
-from .attachments import (
-    AttachmentError,
-    attachment_note,
-    save_document,
-    save_photo,
-)
+from .attachments import AttachmentError, attachment_note, save_document, save_photo
 from .config import Config
-from .glm_client import GLMClient, GLMError
 from .history import History
 from .splitter import split_for_telegram
-from .voice import VoiceError, voice_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +37,6 @@ def _agent(context: ContextTypes.DEFAULT_TYPE) -> Agent:
 
 def _history(context: ContextTypes.DEFAULT_TYPE) -> History:
     return context.bot_data["history"]
-
-
-def _glm(context: ContextTypes.DEFAULT_TYPE) -> GLMClient:
-    return context.bot_data["glm"]
 
 
 def is_allowed(update: Update, allowed_ids: frozenset[int]) -> bool:
@@ -98,7 +86,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply_safe(
         message,
         "Hi! I'm your personal AI assistant.\n\n"
-        "Send me text, a photo, a voice note or a file (as a document). Commands:\n"
+        "Send me text, a photo, or a file (as a document). Commands:\n"
         "/new — start a fresh conversation (clear context)\n"
         "/status — current model and context stats",
     )
@@ -117,7 +105,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /status: show model ids and context statistics."""
+    """Handle /status: show the model and context statistics."""
     cfg = _config(context)
     if not is_allowed(update, cfg.allowed_ids):
         return
@@ -127,28 +115,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     stats = _history(context).stats(message.chat_id)
     await _reply_safe(
         message,
-        f"Model: {cfg.glm_model} (vision: {cfg.glm_vision_model}, ASR: {cfg.glm_asr_model})\n"
+        f"Model: {cfg.glm_model}\n"
         f"Messages in context: {stats['messages']}\n"
         f"Context ≈ {stats['est_tokens']} / {cfg.context_token_budget} tokens\n"
         f"Workspace: {cfg.workspace_dir}",
     )
-
-
-async def _transcribe_voice(message: Message, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Download and transcribe a voice note; returns the user-facing text."""
-    cfg = _config(context)
-    voice = message.voice
-    if voice is None:
-        return ""
-    if voice.file_size and voice.file_size > 20 * 1024 * 1024:
-        raise AttachmentError("Voice message too large (over 20 MB).")
-    tg_file = await context.bot.get_file(voice.file_id)
-    with tempfile.TemporaryDirectory(prefix="tgvoice-") as tmp:
-        ogg = Path(tmp) / "voice.ogg"
-        await tg_file.download_to_drive(ogg)
-        return await voice_to_text(
-            ogg, voice.duration or 0, _glm(context), Path(tmp), cfg.max_voice_min
-        )
 
 
 async def _collect_user_text(
@@ -159,14 +130,8 @@ async def _collect_user_text(
     workspace = cfg.workspace_dir
     images: list[Path] = []
 
-    if message.voice is not None:
-        text = await _transcribe_voice(message, context)
-        return f"[voice message transcription]\n{text}", []
-
-    if message.video_note is not None or message.audio is not None:
-        await _reply_safe(
-            message, "I can't process audio/video files yet — send a voice note instead."
-        )
+    if message.voice is not None or message.video_note is not None or message.audio is not None:
+        await _reply_safe(message, "I don't support voice or audio messages — please send text.")
         return None
 
     if message.photo:
@@ -205,7 +170,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     try:
         collected = await _collect_user_text(message, context)
-    except (AttachmentError, VoiceError, GLMError) as exc:
+    except AttachmentError as exc:
         await _reply_safe(message, f"⚠️ {exc}")
         return
     if collected is None:

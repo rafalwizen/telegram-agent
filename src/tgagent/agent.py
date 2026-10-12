@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .config import Config
-from .glm_client import GLMClient, GLMError
+from .glm_client import GLMClient, GLMError, is_quota_error
 from .history import History
 from .prompts import SYSTEM_PROMPT
 from .tools import TOOL_SPECS, ToolContext
@@ -23,6 +23,22 @@ ProgressFn = Callable[[int, str, str], Awaitable[None]]
 
 class AgentError(Exception):
     """User-facing error, shown to the user as the result of the turn."""
+
+
+def friendly_glm_error(exc: GLMError) -> str | None:
+    """Map known GLM billing/quota errors to a clear, human explanation."""
+    text = str(exc).lower()
+    if "1113" in text or "insufficient balance" in text or "recharge" in text:
+        return (
+            "GLM account has no pay-as-you-go balance for this feature. "
+            "Chat and tools run on the Coding Plan; this feature would need standard API balance."
+        )
+    if is_quota_error(text):
+        return (
+            "GLM Coding Plan usage limit reached for the current 5-hour window — "
+            "please try again after the window resets."
+        )
+    return None
 
 
 class Agent:
@@ -43,19 +59,32 @@ class Agent:
         messages = self._history.build_context(
             chat_id, SYSTEM_PROMPT, self._cfg.context_token_budget
         )
+
+        data_urls = [url for url in (prepare_image(p) for p in (image_paths or [])) if url]
+        if data_urls:
+            # Image turn: single completion on the Anthropic-compatible endpoint,
+            # no tool loop (tools are used on follow-up text turns).
+            try:
+                final = await self._glm.vision_chat(SYSTEM_PROMPT, messages, data_urls)
+            except GLMError as exc:
+                logger.error("GLM vision_chat failed: %s", exc)
+                raise AgentError(
+                    friendly_glm_error(exc) or f"GLM API error — please try again. ({exc})"
+                ) from exc
+            final = final.strip() or "*(empty response)*"
+            self._history.append(chat_id, "assistant", final)
+            return final
+
         ctx = ToolContext(chat_id=chat_id, workspace=self._cfg.workspace_dir, cfg=self._cfg)
-
-        model = self._cfg.glm_model
-        if image_paths:
-            model = self._attach_images(messages, image_paths) or model
-
         final: str | None = None
         for iteration in range(1, self._cfg.max_tool_iters + 1):
             try:
-                answer = await self._glm.chat(messages, model=model, tools=TOOL_SPECS)
+                answer = await self._glm.chat(messages, model=self._cfg.glm_model, tools=TOOL_SPECS)
             except GLMError as exc:
                 logger.error("GLM chat failed: %s", exc)
-                raise AgentError(f"GLM API error — please try again. ({exc})") from exc
+                raise AgentError(
+                    friendly_glm_error(exc) or f"GLM API error — please try again. ({exc})"
+                ) from exc
 
             tool_calls = getattr(answer, "tool_calls", None)
             if not tool_calls:
@@ -105,18 +134,3 @@ class Agent:
             final = "I reached my tool-use limit for this message — please rephrase or continue."
         self._history.append(chat_id, "assistant", final)
         return final
-
-    def _attach_images(self, messages: list[dict], image_paths: list[Path]) -> str | None:
-        """Turn the latest user message multimodal; return the vision model name on success.
-
-        Images are attached to the current turn only — history stays text-only to save tokens.
-        """
-        data_urls = [url for url in (prepare_image(p) for p in image_paths) if url]
-        if not data_urls:
-            return None
-        if not messages or messages[-1].get("role") != "user":
-            return None
-        parts: list[dict] = [{"type": "text", "text": messages[-1]["content"]}]
-        parts += [{"type": "image_url", "image_url": {"url": url}} for url in data_urls]
-        messages[-1] = {"role": "user", "content": parts}
-        return self._cfg.glm_vision_model

@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# ffmpeg: voice-note transcription; DejaVu fonts: matplotlib in a headless container.
+# DejaVu fonts: matplotlib in a headless container.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
+    && apt-get install -y --no-install-recommends fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

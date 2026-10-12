@@ -1,10 +1,13 @@
 # telegram-agent
 
 Personal Telegram AI assistant powered by GLM (Zhipu / Z.ai), running on your own VPS
-in Docker. You chat with it like with any AI chat app; it accepts text, photos, voice
-notes and documents (PDF/DOCX/XLSX/CSV/…). The agent has a private **workspace** where
-your files land and where it can write and run its own Python scripts (pandas,
-matplotlib preinstalled) inside a sandbox with time/RAM limits and no access to secrets.
+in Docker. You chat with it like with any AI chat app; it accepts text, photos and
+documents (PDF/DOCX/XLSX/CSV/…). The agent has a private **workspace** where your
+files land and where it can write and run its own Python scripts (pandas, matplotlib
+preinstalled) inside a sandbox with time/RAM limits and no access to secrets.
+
+Runs entirely on a **GLM Coding Plan** (e.g. Lite) — the same subscription and
+5-hour windows you use with Claude Code; no pay-as-you-go balance required.
 
 ## Features
 
@@ -12,7 +15,7 @@ matplotlib preinstalled) inside a sandbox with time/RAM limits and no access to 
 - Single-user by design: only whitelisted Telegram user ids can talk to the bot
 - Persistent conversation history per chat (SQLite) with token-budget context trimming
 - Tool-calling agent: `list_files`, `read_file`, `write_file`, `extract_text`, `run_python`
-- Images routed to a GLM vision model; voice notes transcribed via GLM ASR (ffmpeg)
+- Images analyzed through the Anthropic-compatible endpoint of the Coding Plan
 - Sandboxed script execution: `python -I`, whitelisted environment (no API keys),
   CPU/RAM/file-size rlimits, wall-clock timeout, own process group
 - Docker deployment: non-root container, mem/cpu caps, healthcheck, auto-restart
@@ -34,14 +37,21 @@ matplotlib preinstalled) inside a sandbox with time/RAM limits and no access to 
 
 ### 2. GLM API key
 
-Get an API key from [Z.ai](https://z.ai) (international) or
-[BigModel](https://open.bigmodel.cn) (China). The base URL must match where the key
-comes from:
+**Recommended: GLM Coding Plan** (Lite or higher) — the same plan you use with
+Claude Code. Everything (chat, tools, image analysis) runs within the plan's
+5-hour windows:
 
-| Platform | `GLM_BASE_URL` |
+| Variable | Value |
 |---|---|
-| Z.ai (international) | `https://api.z.ai/api/paas/v4` |
-| BigModel (China) | `https://open.bigmodel.cn/api/paas/v4` |
+| `GLM_API_KEY` | your Coding Plan key (the one Claude Code uses) |
+| `GLM_BASE_URL` | `https://api.z.ai/api/coding/paas/v4` |
+| `GLM_MODEL` | `glm-5.2` |
+| `GLM_ANTHROPIC_BASE_URL` | `https://api.z.ai/api/anthropic` (images; already the default) |
+
+Note: the bot **shares the 5-hour window quota with your Claude Code sessions**.
+
+Alternative: pay-as-you-go API (`https://api.z.ai/api/paas/v4`, requires balance).
+China platform: `https://open.bigmodel.cn/api/coding/paas/v4` and `.../api/anthropic`.
 
 ### 3. Local development
 
@@ -54,7 +64,7 @@ cp .env.example .env             # fill in TELEGRAM_BOT_TOKEN, ALLOWED_TELEGRAM_
 make run                         # or: python -m tgagent
 ```
 
-Requires Python 3.11+ and `ffmpeg` on PATH for voice notes (optional in dev).
+Requires Python 3.11+.
 
 ### 4. VPS deployment (Docker)
 
@@ -77,9 +87,9 @@ fails if it is stale for >10 min (watchdog for silent hangs).
 ## Configuration
 
 All settings come from environment variables (see `.env.example`): bot token, allowed
-user ids, GLM key/base URL/models (`GLM_MODEL`, `GLM_VISION_MODEL`, `GLM_ASR_MODEL`),
-agent limits (`MAX_TOOL_ITERS`, `CONTEXT_TOKEN_BUDGET`), sandbox limits
-(`PY_TIMEOUT`, `PY_MEM_MB`) and voice limit (`MAX_VOICE_MINUTES`).
+user ids, GLM key/base URLs/model, agent limits (`MAX_TOOL_ITERS`,
+`CONTEXT_TOKEN_BUDGET`) and sandbox limits (`PY_TIMEOUT`, `PY_MEM_MB`).
+Voice notes are not supported.
 
 ## Workspace layout
 
@@ -118,7 +128,6 @@ src/tgagent/
 ├── sandbox.py       # path confinement + run_python subprocess sandbox
 ├── extract.py       # PDF/DOCX/XLSX/CSV/TXT extraction
 ├── attachments.py   # Telegram file downloads → inbox
-├── voice.py         # ffmpeg segmentation → ASR
 ├── vision.py        # image → base64 data URL with downscaling
 ├── history.py       # SQLite history + context building
 ├── splitter.py      # 4096-char message splitting
