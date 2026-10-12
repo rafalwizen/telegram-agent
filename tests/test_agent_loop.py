@@ -15,10 +15,10 @@ class FakeGLM:
 
     def __init__(self, responses: list) -> None:
         self._responses = list(responses)
-        self.calls: list[tuple[list[dict], list | None]] = []
+        self.calls: list[tuple[list[dict], str | None, list | None]] = []
 
     async def chat(self, messages, *, model=None, tools=None, max_tokens=4000):
-        self.calls.append(([dict(m) for m in messages], tools))
+        self.calls.append(([dict(m) for m in messages], model, tools))
         return self._responses.pop(0)
 
 
@@ -56,10 +56,10 @@ async def test_tool_round_trip(tmp_path: Path, make_cfg):
     assert out == "The script ran and printed 'hi'."
     assert (cfg.workspace_dir / "scripts" / "hi.py").exists()
     # Second model call saw the tool result for the write, third saw the run output.
-    second_messages, _ = fake.calls[1]
+    second_messages, _, _ = fake.calls[1]
     write_result = next(m for m in second_messages if m["role"] == "tool")
     assert "wrote" in write_result["content"]
-    third_messages, _ = fake.calls[2]
+    third_messages, _, _ = fake.calls[2]
     run_result = [m for m in third_messages if m["role"] == "tool"][-1]
     assert "exit_code=0" in run_result["content"]
 
@@ -80,7 +80,7 @@ async def test_invalid_json_arguments(tmp_path: Path, make_cfg):
         history.close()
 
     assert out == "Recovered."
-    second_messages, _ = fake.calls[1]
+    second_messages, _, _ = fake.calls[1]
     tool_result = next(m for m in second_messages if m["role"] == "tool")
     assert "ERROR" in tool_result["content"]
 
@@ -114,3 +114,31 @@ async def test_plain_answer_without_tools(tmp_path: Path, make_cfg):
 
     assert out == "Just an answer."
     assert len(fake.calls) == 1
+
+
+async def test_image_paths_route_to_vision_model(tmp_path: Path, make_cfg):
+    from PIL import Image
+
+    cfg = make_cfg()
+    image = cfg.workspace_dir / "photo.png"
+    image.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (60, 40), (10, 120, 200)).save(image, format="PNG")
+
+    fake = FakeGLM([_message(content="A blue rectangle.")])
+    history = History(tmp_path / "bot.db")
+    agent = Agent(cfg, fake, history)
+    try:
+        out = await agent.handle_turn(1, "what is this?", image_paths=[image])
+    finally:
+        history.close()
+
+    assert out == "A blue rectangle."
+    messages, model, _ = fake.calls[0]
+    assert model == cfg.glm_vision_model
+    # The last user message became multimodal: text part + image data URL part.
+    content = messages[-1]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert content[0]["text"] == "what is this?"
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
