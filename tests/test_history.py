@@ -51,3 +51,20 @@ def test_stats(history):
     stats = history.stats(1)
     assert stats["messages"] == 1
     assert stats["est_tokens"] == 2
+
+
+def test_import_messages_replaces_history(history):
+    history.append(1, "user", "old conversation")
+    history.import_messages(1, [("user", "a"), ("assistant", "b")])
+    assert history.all_messages(1) == [("user", "a"), ("assistant", "b")]
+
+
+def test_import_messages_append_mode(history):
+    history.import_messages(1, [("user", "a"), ("assistant", "b")])
+    history.import_messages(1, [("user", "c")], reset=False)
+    assert history.all_messages(1) == [("user", "a"), ("assistant", "b"), ("user", "c")]
+    assert history.stats(1)["messages"] == 3
+
+
+def test_all_messages_empty_chat(history):
+    assert history.all_messages(42) == []
