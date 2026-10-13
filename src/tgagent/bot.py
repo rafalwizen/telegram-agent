@@ -31,6 +31,8 @@ BOT_COMMANDS = [
     BotCommand("status", "model and context stats"),
     BotCommand("files", "list files in my workspace"),
     BotCommand("clear_files", "delete all workspace files (confirm with 'yes')"),
+    BotCommand("import", "load a conversation from a Claude Code .jsonl or JSON file"),
+    BotCommand("export", "download this conversation as a JSON file"),
 ]
 
 
@@ -82,6 +84,8 @@ def build_application(cfg: Config, agent: Agent, history: History, glm: GLMClien
     application.add_handler(CommandHandler("status", handlers.cmd_status))
     application.add_handler(CommandHandler("files", handlers.cmd_files))
     application.add_handler(CommandHandler("clear_files", handlers.cmd_clear_files))
+    application.add_handler(CommandHandler("import", handlers.cmd_import))
+    application.add_handler(CommandHandler("export", handlers.cmd_export))
     application.add_handler(MessageHandler(~filters.COMMAND, handlers.on_message))
     application.add_error_handler(handlers.on_error)
     return application

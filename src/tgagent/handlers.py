@@ -7,15 +7,17 @@ import logging
 import shutil
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import telegram.error
-from telegram import Message, Update
+from telegram import Document, Message, Update
 from telegram.ext import ContextTypes
 
 from .agent import Agent, AgentError
 from .attachments import AttachmentError, attachment_note, save_document, save_photo
 from .config import Config
+from .conversation_io import ConversationIOError, messages_to_json, parse_conversation
 from .history import History
 from .splitter import split_for_telegram
 
@@ -27,6 +29,8 @@ SEND_ATTEMPTS = 3
 PROGRESS_EDIT_INTERVAL = 2.0  # seconds between placeholder progress edits
 DEFAULT_IMAGE_PROMPT = "Describe what is in this image, briefly."
 WORKSPACE_SUBDIRS = ("inbox", "scripts", "out")
+IMPORT_PENDING_TTL_S = 600  # how long /import waits for the conversation file
+PENDING_IMPORTS: dict[int, float] = {}  # chat_id -> deadline (time.monotonic())
 
 
 def list_workspace_files(workspace: Path, max_entries: int = 40) -> str:
@@ -133,7 +137,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/new — start a fresh conversation (clear context)\n"
         "/status — current model and context stats\n"
         "/files — list files in my workspace\n"
-        "/clear_files — delete all workspace files (needs confirmation)",
+        "/clear_files — delete all workspace files (needs confirmation)\n"
+        "/import — load a conversation from a file (Claude Code .jsonl or JSON)\n"
+        "/export — download this conversation as a JSON file",
     )
 
 
@@ -209,6 +215,105 @@ async def cmd_clear_files(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+def _import_pending(chat_id: int) -> bool:
+    """True if this chat is waiting for a conversation file after /import."""
+    deadline = PENDING_IMPORTS.get(chat_id)
+    if deadline is None:
+        return False
+    if time.monotonic() > deadline:
+        PENDING_IMPORTS.pop(chat_id, None)
+        return False
+    return True
+
+
+async def _run_import(
+    message: Message, context: ContextTypes.DEFAULT_TYPE, document: Document
+) -> None:
+    """Download a conversation file, parse it and load it into this chat's history."""
+    chat_id = message.chat_id
+    PENDING_IMPORTS.pop(chat_id, None)
+    cfg = _config(context)
+    try:
+        rel = await save_document(context.bot, document, cfg.workspace_dir)
+    except AttachmentError as exc:
+        await _reply_safe(message, f"⚠️ {exc}")
+        return
+    path = cfg.workspace_dir / rel
+    try:
+        # utf-8-sig strips a BOM if the editor added one.
+        text = await asyncio.to_thread(path.read_text, "utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        await _reply_safe(message, f"⚠️ Could not read the file: {exc}")
+        return
+    try:
+        parsed = await asyncio.to_thread(parse_conversation, text)
+    except ConversationIOError as exc:
+        await _reply_safe(message, f"⚠️ {exc}")
+        return
+    _history(context).import_messages(chat_id, parsed)
+    stats = _history(context).stats(chat_id)
+    await _reply_safe(
+        message,
+        f"✅ Imported {len(parsed)} messages (~{stats['est_tokens'] / 1000:.0f}k tokens) from "
+        f"{document.file_name or rel}.\n"
+        f"Context keeps the newest ~{cfg.context_token_budget // 1000}k tokens. "
+        "Continue the conversation — I remember it now.",
+    )
+
+
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /import: load a conversation from a Claude Code .jsonl or JSON file."""
+    cfg = _config(context)
+    if not is_allowed(update, cfg.allowed_ids):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    args = context.args or []
+    if args and args[0].lower() == "cancel":
+        PENDING_IMPORTS.pop(message.chat_id, None)
+        await _reply_safe(message, "Import cancelled.")
+        return
+    # Stateless shortcut: /import sent as a reply to a document imports that file.
+    replied = message.reply_to_message
+    if replied is not None and replied.document is not None:
+        await _run_import(message, context, replied.document)
+        return
+    PENDING_IMPORTS[message.chat_id] = time.monotonic() + IMPORT_PENDING_TTL_S
+    await _reply_safe(
+        message,
+        "📥 Send me the conversation file now — a Claude Code session (.jsonl) "
+        "or a JSON array of messages.\n"
+        "⚠️ It will REPLACE the current conversation in this chat "
+        f"(pending for {IMPORT_PENDING_TTL_S // 60} min; /import cancel aborts).",
+    )
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /export: send the whole conversation as a JSON document (local, no model call)."""
+    cfg = _config(context)
+    if not is_allowed(update, cfg.allowed_ids):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    messages = _history(context).all_messages(message.chat_id)
+    if not messages:
+        await _reply_safe(message, "Nothing to export — this chat has no history yet.")
+        return
+    payload = await asyncio.to_thread(messages_to_json, messages)
+    path = cfg.workspace_dir / "out" / f"conversation-{datetime.now():%Y%m%d-%H%M%S}.json"
+    await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(path.write_text, payload, "utf-8")
+    try:
+        await message.reply_document(document=path, filename=path.name)
+    except telegram.error.TelegramError:
+        logger.warning("reply_document failed", exc_info=True)
+        await _reply_safe(
+            message, f"Saved the export to {path.name}, but sending it failed — see /files."
+        )
+
+
 async def _collect_user_text(
     message: Message, context: ContextTypes.DEFAULT_TYPE
 ) -> tuple[str, list[Path]] | None:
@@ -254,6 +359,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = update.message
     if message is None:
         return
+
+    if _import_pending(message.chat_id):
+        if message.document is not None:
+            await _run_import(message, context, message.document)
+            return
+        # Any other message cancels the pending import and is processed normally.
+        PENDING_IMPORTS.pop(message.chat_id, None)
 
     try:
         collected = await _collect_user_text(message, context)

@@ -47,6 +47,28 @@ class History:
             self._conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
             self._conn.commit()
 
+    def import_messages(
+        self, chat_id: int, messages: list[tuple[str, str]], reset: bool = True
+    ) -> None:
+        """Insert a batch of (role, content) turns, optionally replacing the chat's history."""
+        with self._lock:
+            if reset:
+                self._conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+            self._conn.executemany(
+                "INSERT INTO messages(chat_id, role, content, est_tokens) VALUES (?, ?, ?, ?)",
+                [(chat_id, role, content, est_tokens(content)) for role, content in messages],
+            )
+            self._conn.commit()
+
+    def all_messages(self, chat_id: int) -> list[tuple[str, str]]:
+        """Return the full conversation for a chat, oldest first (for /export)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id",
+                (chat_id,),
+            ).fetchall()
+        return [(row["role"], row["content"]) for row in rows]
+
     def build_context(
         self, chat_id: int, system_prompt: str, budget_tokens: int
     ) -> list[dict[str, Any]]:
