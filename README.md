@@ -16,6 +16,8 @@ Runs entirely on a **GLM Coding Plan** (e.g. Lite) — the same subscription and
 - Persistent conversation history per chat (SQLite) with token-budget context trimming
 - Tool-calling agent: `list_files`, `read_file`, `write_file`, `extract_text`, `run_python`
 - Images analyzed through the Anthropic-compatible endpoint of the Coding Plan
+- Conversation import/export: continue a Claude Code session inside Telegram (`/import`),
+  back up or move a bot conversation anywhere (`/export`)
 - Sandboxed script execution: `python -I`, whitelisted environment (no API keys),
   CPU/RAM/file-size rlimits, wall-clock timeout, own process group
 - Docker deployment: non-root container, mem/cpu caps, healthcheck, auto-restart
@@ -101,6 +103,28 @@ data/workspace/          # agent's playground (bind-mounted into the container)
 data/bot/bot.db          # conversation history (SQLite)
 ```
 
+## Moving conversations (/import, /export)
+
+**Claude Code → bot.** Claude Code stores every session as a JSONL file:
+
+```
+Linux/macOS:  ~/.claude/projects/<project>/<session-id>.jsonl
+Windows:      %USERPROFILE%\.claude\projects\<project>\<session-id>.jsonl
+```
+
+(`<project>` is the working directory with non-alphanumeric characters replaced by `-`.
+Sessions are kept for 30 days by default.) Send that file to the bot and either reply to it
+with `/import`, or send `/import` first and then the file. The bot parses the dialogue
+(user/assistant text — thinking, tool calls and command wrappers are skipped) and loads it
+into the chat's history, **replacing** the current conversation. Note: Claude Code's own
+`/export` produces a rendered text transcript for humans — it cannot be imported; use the
+raw `.jsonl` session file.
+
+**Bot → anywhere.** `/export` sends the whole conversation as a JSON file
+(`[{"role": "user"|"assistant", "content": "..."}]`). Import it back later, or feed it to
+any other tool that accepts this format. If an imported conversation exceeds the context
+budget, the oldest turns are trimmed automatically (`build_context` keeps the newest).
+
 ## Security model
 
 - **Allowlist first**: every update is checked against `ALLOWED_TELEGRAM_IDS`; others are ignored.
@@ -122,9 +146,10 @@ src/tgagent/
 ├── config.py        # env → typed config, fail-fast
 ├── bot.py           # Application factory, heartbeat
 ├── handlers.py      # Telegram routing, auth, UX flow
-├── glm_client.py    # GLM chat + ASR (OpenAI-compatible SDK)
+├── glm_client.py    # GLM chat + vision (OpenAI/Anthropic-compatible endpoints)
 ├── agent.py         # tool-calling loop, vision routing
 ├── tools.py         # tool specs + dispatch
+├── conversation_io.py # /import + /export: Claude Code JSONL and JSON parsing
 ├── sandbox.py       # path confinement + run_python subprocess sandbox
 ├── extract.py       # PDF/DOCX/XLSX/CSV/TXT extraction
 ├── attachments.py   # Telegram file downloads → inbox
