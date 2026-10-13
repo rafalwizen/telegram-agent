@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -25,6 +26,48 @@ LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 SEND_ATTEMPTS = 3
 PROGRESS_EDIT_INTERVAL = 2.0  # seconds between placeholder progress edits
 DEFAULT_IMAGE_PROMPT = "Describe what is in this image, briefly."
+WORKSPACE_SUBDIRS = ("inbox", "scripts", "out")
+
+
+def list_workspace_files(workspace: Path, max_entries: int = 40) -> str:
+    """Human-readable listing of workspace files (no model involved, zero API cost)."""
+    lines: list[str] = []
+    for p in sorted(workspace.rglob("*")):
+        if not p.is_file():
+            continue
+        if len(lines) >= max_entries:
+            lines.append(f"... (more files, truncated at {max_entries})")
+            break
+        rel = p.relative_to(workspace).as_posix()
+        lines.append(f"{rel} ({p.stat().st_size / 1024:.0f} KB)")
+    return "\n".join(lines) or "(workspace is empty)"
+
+
+def clear_workspace(workspace: Path) -> tuple[int, int]:
+    """Delete everything inside the workspace and recreate the conventional subdirs.
+
+    Returns (files_removed, bytes_freed).
+    """
+    removed = 0
+    freed = 0
+    for child in workspace.iterdir():
+        try:
+            if child.is_dir() and not child.is_symlink():
+                for inner in child.rglob("*"):
+                    if inner.is_file():
+                        removed += 1
+                        freed += inner.stat().st_size
+                shutil.rmtree(child)
+            else:
+                if child.is_file():
+                    removed += 1
+                    freed += child.stat().st_size
+                child.unlink()
+        except OSError:
+            logger.warning("Could not remove %s", child, exc_info=True)
+    for sub in WORKSPACE_SUBDIRS:
+        (workspace / sub).mkdir(parents=True, exist_ok=True)
+    return removed, freed
 
 
 def _config(context: ContextTypes.DEFAULT_TYPE) -> Config:
@@ -88,7 +131,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Hi! I'm your personal AI assistant.\n\n"
         "Send me text, a photo, or a file (as a document). Commands:\n"
         "/new — start a fresh conversation (clear context)\n"
-        "/status — current model and context stats",
+        "/status — current model and context stats\n"
+        "/files — list files in my workspace\n"
+        "/clear_files — delete all workspace files (needs confirmation)",
     )
 
 
@@ -119,6 +164,48 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Messages in context: {stats['messages']}\n"
         f"Context ≈ {stats['est_tokens']} / {cfg.context_token_budget} tokens\n"
         f"Workspace: {cfg.workspace_dir}",
+    )
+
+
+async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /files: list workspace files (local, no model call)."""
+    cfg = _config(context)
+    if not is_allowed(update, cfg.allowed_ids):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    text = await asyncio.to_thread(list_workspace_files, cfg.workspace_dir)
+    chunks = split_for_telegram(text)
+    await _reply_safe(message, chunks[0])
+    for chunk in chunks[1:]:
+        await asyncio.sleep(1.0)
+        await _reply_safe(message, chunk)
+
+
+async def cmd_clear_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /clear_files: delete all workspace files; requires 'yes' confirmation."""
+    cfg = _config(context)
+    if not is_allowed(update, cfg.allowed_ids):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    args = context.args or []
+    if not args or args[0].lower() not in ("yes", "tak"):
+        preview = await asyncio.to_thread(list_workspace_files, cfg.workspace_dir, 15)
+        await _reply_safe(
+            message,
+            "⚠️ This will delete ALL files in my workspace (inbox, scripts, out):\n"
+            f"{preview}\n\n"
+            "Run /clear_files yes to confirm.",
+        )
+        return
+    removed, freed = await asyncio.to_thread(clear_workspace, cfg.workspace_dir)
+    await _reply_safe(
+        message,
+        f"🗑 Removed {removed} files ({freed / 1e6:.1f} MB). "
+        "inbox/, scripts/ and out/ were recreated empty.",
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from telegram import BotCommand
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -23,6 +24,15 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S = 60
 
+# Shown by Telegram in the "/" command menu of the chat.
+BOT_COMMANDS = [
+    BotCommand("start", "what I can do"),
+    BotCommand("new", "start a fresh conversation (clear context)"),
+    BotCommand("status", "model and context stats"),
+    BotCommand("files", "list files in my workspace"),
+    BotCommand("clear_files", "delete all workspace files (confirm with 'yes')"),
+]
+
 
 async def _heartbeat_loop(application: Application) -> None:
     """Touch the heartbeat file periodically; the Docker healthcheck watches its age."""
@@ -36,6 +46,11 @@ async def _heartbeat_loop(application: Application) -> None:
 
 
 async def _post_init(application: Application) -> None:
+    # Register the command menu so Telegram's "/" button lists our commands.
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+    except Exception:
+        logger.warning("set_my_commands failed (menu may be stale)", exc_info=True)
     # Plain asyncio task: PTB warns about Application.create_task before running state.
     application.bot_data["_heartbeat_task"] = asyncio.create_task(_heartbeat_loop(application))
 
@@ -65,6 +80,8 @@ def build_application(cfg: Config, agent: Agent, history: History, glm: GLMClien
     application.add_handler(CommandHandler(["start", "help"], handlers.cmd_start))
     application.add_handler(CommandHandler("new", handlers.cmd_new))
     application.add_handler(CommandHandler("status", handlers.cmd_status))
+    application.add_handler(CommandHandler("files", handlers.cmd_files))
+    application.add_handler(CommandHandler("clear_files", handlers.cmd_clear_files))
     application.add_handler(MessageHandler(~filters.COMMAND, handlers.on_message))
     application.add_error_handler(handlers.on_error)
     return application
